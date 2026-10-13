@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <limits>
+#include <vector>
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -362,6 +364,33 @@ static IR::Value IsMbcntWithExec(IR::Value value, bool is_hi, IR::U1 exec) {
     return inst->Arg(1);
 }
 
+// Same as IsMbcntWithExec but accepts a ballot of any mask (inside branches the
+// ballot is often of the branch condition rather than the exec value seen by ds_append).
+static IR::Value IsMbcntAnyMask(IR::Value value, bool is_hi) {
+    if (value.IsImmediate()) {
+        return {};
+    }
+    const IR::Inst* inst = value.Inst();
+    if (inst->GetOpcode() != IR::Opcode::MaskedBitCount32 || inst->Arg(0).IsImmediate() ||
+        inst->Arg(2).U1() != is_hi) {
+        return {};
+    }
+    IR::Inst* prod = inst->Arg(0).Inst();
+    if (prod->GetOpcode() != IR::Opcode::CompositeExtractU32x2 || prod->Arg(0).IsImmediate() ||
+        prod->Arg(1).U32() != is_hi) {
+        return {};
+    }
+    prod = prod->Arg(0).Inst();
+    if (prod->GetOpcode() != IR::Opcode::UnpackUint2x32 || prod->Arg(0).IsImmediate()) {
+        return {};
+    }
+    prod = prod->Arg(0).Inst();
+    if (prod->GetOpcode() != IR::Opcode::Ballot) {
+        return {};
+    }
+    return inst->Arg(1);
+}
+
 static IR::Use FindUniqueUser(IR::Inst* inst, auto&& pred) {
     IR::Use picked{};
     for (auto& use : inst->Uses()) {
@@ -400,7 +429,26 @@ static void RemoveAppendBufferLaneOffset(IR::Inst& vx) {
     // v_sub_i32       idx, vcc, vK, vZ
 
     IR::U1 exec{vx.Arg(1)};
-    const auto uses = vx.Uses();
+    // The result may reach the lane-offset math through phi nodes, e.g. when the
+    // ds_append sits inside a branch (Until Dawn hair OIT shaders). Look through them,
+    // otherwise the lane offset is added twice and fragments overwrite each other.
+    std::vector<IR::Use> uses;
+    std::vector<const IR::Inst*> sources{&vx};
+    for (size_t i = 0; i < sources.size(); ++i) {
+        for (const auto& use : sources[i]->Uses()) {
+            if (use.user->GetOpcode() == IR::Opcode::Phi) {
+                if (std::find(sources.begin(), sources.end(), use.user) == sources.end()) {
+                    sources.push_back(use.user);
+                }
+                continue;
+            }
+            uses.push_back(use);
+        }
+    }
+    const auto is_source = [&](const IR::Value& v) {
+        return !v.IsEmpty() && !v.IsImmediate() &&
+               std::find(sources.begin(), sources.end(), v.Inst()) != sources.end();
+    };
     for (auto use : uses) {
         const auto& [user, operand] = use;
         if (user->GetOpcode() == IR::Opcode::MaskedBitCount32) {
@@ -408,16 +456,29 @@ static void RemoveAppendBufferLaneOffset(IR::Inst& vx) {
             ASSERT(vx.GetOpcode() == IR::Opcode::DataAppend);
             IR::Inst* vy = user;
             auto vx_2 = IsMbcntWithExec(IR::Value{vy}, true, exec);
-            ASSERT(!vx_2.IsEmpty() && vx_2 == IR::Value{&vx});
+            ASSERT(is_source(vx_2));
             const auto [idx, operand] = FindUniqueUser(vy, [](const IR::Inst* inst) {
                 return inst->GetOpcode() == IR::Opcode::MaskedBitCount32;
             });
             auto vy_2 = IsMbcntWithExec(IR::Value{idx}, false, exec);
             ASSERT(!vy_2.IsEmpty() && vy_2 == IR::Value{vy});
-            idx->ReplaceUsesWithAndRemove(IR::Value{&vx});
+            idx->ReplaceUsesWithAndRemove(vx_2);
             continue;
         }
         if (user->GetOpcode() != IR::Opcode::IAdd32 && user->GetOpcode() != IR::Opcode::ISub32) {
+            continue;
+        }
+        if (user->Arg(operand).Inst() != &vx) {
+            // Reached through a phi: only handle "phi + lane_id" and leave anything else alone.
+            if (user->GetOpcode() != IR::Opcode::IAdd32) {
+                continue;
+            }
+            const auto lane = user->Arg(1 - operand);
+            const auto hi = IsMbcntAnyMask(lane, false);
+            const auto zero = hi.IsEmpty() ? IR::Value{} : IsMbcntAnyMask(hi, true);
+            if (!zero.IsEmpty() && zero.IsImmediate() && zero.U32() == 0u) {
+                user->SetArg(1 - operand, IR::Value{u32{0u}});
+            }
             continue;
         }
         const auto other = user->Arg(1 - operand);
